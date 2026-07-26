@@ -1,0 +1,280 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Peeklet - backend. A Go Lambda (Function URL) that mints
+  OTP-gated share links to private S3 folders, served through a CloudFront
+  CDN using signed URLs. Share metadata lives in DynamoDB with TTL auto-expiry.
+
+# ---------------------------------------------------------------------------
+# Parameters. Secrets are NoEcho. The RSA keypair + password hash are produced
+# by scripts/gen-keys.sh and cmd/hashpw (see README).
+# ---------------------------------------------------------------------------
+Parameters:
+  MediaBucketName:
+    Type: String
+    Description: Name of the (existing or new) S3 bucket that stores the photos/videos.
+
+  AllowedOrigin:
+    Type: String
+    Description: Origin of the frontend SPA, e.g. https://your-app.pages.dev (used for CORS).
+    Default: '*'
+
+  OwnerPasswordHash:
+    Type: String
+    NoEcho: true
+    Description: bcrypt hash of the owner/admin password (see cmd/hashpw).
+
+  JWTSecret:
+    Type: String
+    NoEcho: true
+    Description: Random secret used to sign session JWTs (32+ bytes recommended).
+
+  CFPublicKeyPem:
+    Type: String
+    Description: PEM-encoded RSA public key for CloudFront signed URLs (gen-keys.sh).
+
+  CFPrivateKeyPem:
+    Type: String
+    NoEcho: true
+    Description: PEM-encoded RSA private key matching CFPublicKeyPem.
+
+# ---------------------------------------------------------------------------
+# Tunable defaults surfaced as Lambda env vars. Change here (or in samconfig),
+# redeploy, done. NOTE: LinkTTL is the *default* stamped onto new shares only;
+# existing shares keep the expiry they were created with.
+# ---------------------------------------------------------------------------
+  LinkTTL:
+    Type: String
+    Default: 360h        # 15 days
+  SessionTTL:
+    Type: String
+    Default: 2h
+  MediaURLTTL:
+    Type: String
+    Default: 2h          # signed-URL lifetime; keep <= SessionTTL
+  CDNCacheTTL:
+    Type: Number
+    Default: 86400       # 1 day, in seconds (enforced by the CloudFront cache policy)
+  OTPLength:
+    Type: Number
+    Default: 8
+  OTPAlphabet:
+    Type: String
+    Default: ABCDEFGHJKMNPQRSTUVWXYZ23456789   # no ambiguous 0/O/1/I/L
+  OTPMaxAttempts:
+    Type: Number
+    Default: 5
+  OTPLockout:
+    Type: String
+    Default: 15m
+  AllowedExt:
+    Type: String
+    Default: jpg,jpeg,png,webp,gif,mp4,webm,mov
+  ListPageSize:
+    Type: Number
+    Default: 100
+
+Globals:
+  Function:
+    Timeout: 15
+    MemorySize: 256
+    Runtime: provided.al2023
+    Architectures: [arm64]
+
+Resources:
+
+  # -------------------------------------------------------------------------
+  # Share metadata store. TTL on `ttl` auto-deletes expired rows (best effort);
+  # the app also checks expiresAt on every read as the real security boundary.
+  # -------------------------------------------------------------------------
+  SharesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: slug
+          AttributeType: S
+      KeySchema:
+        - AttributeName: slug
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # -------------------------------------------------------------------------
+  # Private media bucket. No public access; readable only by CloudFront (OAC).
+  # -------------------------------------------------------------------------
+  MediaBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref MediaBucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods: [GET, HEAD]
+            AllowedOrigins: [!Ref AllowedOrigin]
+            AllowedHeaders: ['*']
+            MaxAge: 3000
+
+  MediaBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref MediaBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontRead
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${MediaBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${MediaDistribution}'
+
+  # -------------------------------------------------------------------------
+  # CloudFront signing keys (for signed URLs) + Origin Access Control.
+  # -------------------------------------------------------------------------
+  CFPublicKey:
+    Type: AWS::CloudFront::PublicKey
+    Properties:
+      PublicKeyConfig:
+        Name: !Sub '${AWS::StackName}-media-key'
+        CallerReference: !Sub '${AWS::StackName}-media-key'
+        EncodedKey: !Ref CFPublicKeyPem
+
+  CFKeyGroup:
+    Type: AWS::CloudFront::KeyGroup
+    Properties:
+      KeyGroupConfig:
+        Name: !Sub '${AWS::StackName}-media-kg'
+        Items:
+          - !Ref CFPublicKey
+
+  CFPrivateKeySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}-cf-private-key'
+      SecretString: !Ref CFPrivateKeyPem
+
+  MediaOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${AWS::StackName}-media-oac'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # Cache the object for CDNCacheTTL. Query strings are EXCLUDED from the cache
+  # key, so the signed-URL params don't fragment the cache: every viewer of a
+  # given object shares one cache entry, while CloudFront still validates each
+  # signature before serving.
+  MediaCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub '${AWS::StackName}-media-cache'
+        MinTTL: 0
+        DefaultTTL: !Ref CDNCacheTTL
+        MaxTTL: !Ref CDNCacheTTL
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingGzip: true
+          EnableAcceptEncodingBrotli: true
+          CookiesConfig:
+            CookieBehavior: none
+          HeadersConfig:
+            HeaderBehavior: none
+          QueryStringsConfig:
+            QueryStringBehavior: none
+
+  MediaDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub '${AWS::StackName} media CDN'
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: media-s3
+            DomainName: !GetAtt MediaBucket.RegionalDomainName
+            OriginAccessControlId: !Ref MediaOAC
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        DefaultCacheBehavior:
+          TargetOriginId: media-s3
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD, OPTIONS]
+          Compress: true
+          CachePolicyId: !Ref MediaCachePolicy
+          TrustedKeyGroups:
+            - !Ref CFKeyGroup
+
+  # -------------------------------------------------------------------------
+  # The Go API. Function URL is public (AuthType NONE) because the app does its
+  # own auth: /api/*/verify needs the OTP, everything else needs a session JWT.
+  # -------------------------------------------------------------------------
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: ./
+      Handler: bootstrap
+      FunctionUrlConfig:
+        AuthType: NONE
+        Cors:
+          AllowOrigins: [!Ref AllowedOrigin]
+          AllowMethods: [GET, POST, DELETE, OPTIONS]
+          AllowHeaders: [content-type, authorization]
+          MaxAge: 300
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref SharesTable
+          MEDIA_BUCKET: !Ref MediaBucket
+          CDN_DOMAIN: !GetAtt MediaDistribution.DomainName
+          CF_KEY_PAIR_ID: !Ref CFPublicKey
+          CF_PRIVATE_KEY_SECRET_ARN: !Ref CFPrivateKeySecret
+          JWT_SECRET: !Ref JWTSecret
+          OWNER_PASSWORD_HASH: !Ref OwnerPasswordHash
+          ALLOWED_ORIGIN: !Ref AllowedOrigin
+          LINK_TTL: !Ref LinkTTL
+          SESSION_TTL: !Ref SessionTTL
+          MEDIA_URL_TTL: !Ref MediaURLTTL
+          CDN_CACHE_TTL: !Ref CDNCacheTTL
+          OTP_LENGTH: !Ref OTPLength
+          OTP_ALPHABET: !Ref OTPAlphabet
+          OTP_MAX_ATTEMPTS: !Ref OTPMaxAttempts
+          OTP_LOCKOUT: !Ref OTPLockout
+          ALLOWED_EXT: !Ref AllowedExt
+          LIST_PAGE_SIZE: !Ref ListPageSize
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SharesTable
+        - S3ReadPolicy:
+            BucketName: !Ref MediaBucket
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref CFPrivateKeySecret
+
+Outputs:
+  FunctionUrl:
+    Description: Base URL of the API (point the SPA at this).
+    Value: !GetAtt ApiFunctionUrl.FunctionUrl
+  CdnDomain:
+    Description: CloudFront domain serving the media.
+    Value: !GetAtt MediaDistribution.DomainName
+  TableName:
+    Value: !Ref SharesTable
+  MediaBucket:
+    Value: !Ref MediaBucket
+  CFKeyPairId:
+    Value: !Ref CFPublicKey

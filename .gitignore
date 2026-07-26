@@ -1,0 +1,40 @@
+# ---- SAM / build artifacts ----
+.aws-sam/
+bootstrap              # compiled Lambda binary (make build-ApiFunction output)
+/build/
+/dist/
+
+# ---- secrets & local config (NEVER commit) ----
+samconfig.toml         # may contain deploy params; commit samconfig.toml.example instead
+*.pem                  # CloudFront RSA keypair
+*.pem.txt
+.env
+.env.*
+secrets.json
+*.secret
+
+# ---- Go ----
+/vendor/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test               # test binaries
+*.out                # e.g. profile output
+coverage.out
+coverage.html
+go.work
+go.work.sum
+
+# ---- editors / OS ----
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ---- logs / tmp ----
+*.log
+tmp/
