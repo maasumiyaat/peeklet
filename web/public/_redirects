@@ -1,0 +1,5 @@
+# Cloudflare Pages routing. Order matters: specific rules before the catch-all.
+/admin        /admin.html    200
+/admin/*      /admin.html    200
+# SPA fallback so short links like /s/{slug} serve the viewer app:
+/*            /index.html    200
